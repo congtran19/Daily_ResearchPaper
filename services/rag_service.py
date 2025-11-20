@@ -1,82 +1,145 @@
-from typing import List, Dict, Any, Optional
-from langchain.prompts import PromptTemplate
-from openai import OpenAI
-from data.repositories.FaissVectorRepository import VectorRepository
-from langchain.docstore.document import Document
-from langchain_community.chat_models import ChatOpenAI, ChatOllama
 
+import os
+from typing import Dict, List, Any
+from dotenv import load_dotenv
+from langchain.prompts import ChatPromptTemplate
+from data.repositories.FaissVectorRepository import VectorRepository
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferWindowMemory
+from LLM.model_via_openrouter import OpenRouterChat
+import logging
+load_dotenv()
 
 class RAGService:
+    """RAG Service: FAISS + OpenRouterChat + Memory + Citations."""
+    
     def __init__(
         self,
-        vector_repo: Optional[VectorRepository] = None,
-        llm_model: str = "gpt-4o-mini", # hoặc qwen2.5, llama3,...
-        temperature: float = 0.0,
-        default_k: int = 4,
+        faiss_path: str = "vector_index/faiss_index",
+        top_k: int = 3,
+        memory_k: int = 5,
+        verbose: bool = False
     ):
-        self.vector_repo = vector_repo or VectorRepository()
-        self.default_k = default_k
-
-        if self.vector_repo.vectorstore is None:
-            raise RuntimeError("❌ Vector DB chưa load. Chạy embed trước.")
-
-        # === chọn LLM chuẩn v0.2 ===
-        if llm_provider.lower() == "openai":
-            # ⚠️ yêu cầu export OPENAI_API_KEY
-            self.llm = ChatOpenAI(
-                model=llm_model,
-                temperature=temperature,
-            )
-        elif llm_provider.lower() == "ollama":
-            self.llm = ChatOllama(
-                model=llm_model,
-                temperature=temperature,
-            )
-        else:
-            raise ValueError("llm_provider phải là 'openai' hoặc 'ollama'")
-
-        self.prompt_template = PromptTemplate(
-            input_variables=["context", "question"],
-            template=(
-                "Answer only using the context. If missing info, say 'I don't know'.\n\n"
-                "=== Context ===\n{context}\n\n"
-                "=== Question ===\n{question}\n\nAnswer:\n"
-            )
+        # 1. LLM
+        self.llm = OpenRouterChat()
+        
+        # 2. Vector DB
+        self.repo = VectorRepository()
+        self.embeddings = self.repo.embeddings
+        self.vectorstore = self.repo.vectorstore
+        self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": top_k})
+        
+        # 3. Memory
+        self.memory = ConversationBufferWindowMemory(
+            memory_key="chat_history",
+            return_messages=True,
+            k=memory_k,
+            input_key="question",
+            output_key="answer"
         )
+        
+        # 4. Prompt (đúng format cho ConversationalRetrievalChain)
+        self.prompt = ChatPromptTemplate.from_template(
+            """
+System: Dùng context để trả lời chính xác. Nếu có thông tin, hãy trích dẫn [arxiv_id] ở cuối câu. Nếu không biết, trả lời: "Không tìm thấy info." Trả lời ngắn gọn, dưới 3 câu.
 
-    def _format_context(self, docs: List[Document]) -> str:
-        parts = []
-        for i, d in enumerate(docs, start=1):
-            title = d.metadata.get("title") if d.metadata else "No Title"
-            url = d.metadata.get("url") if d.metadata else "No URL"
-            parts.append(f"[{i}] {title} ({url})\n{d.page_content}")
-        return "\n\n".join(parts)
+Context: {context}
 
-    def _extract_sources(self, docs: List[Document]) -> List[Dict[str, str]]:
-        sources = []
-        for i, d in enumerate(docs, start=1):
-            sources.append({
-                "tag": f"[{i}]",
-                "title": d.metadata.get("title"),
-                "url": d.metadata.get("url"),
-            })
-        return sources
+Chat History: {chat_history}
 
-    def query(self, question: str, k: Optional[int] = None) -> Dict[str, Any]:
-        k = k or self.default_k
-        docs = self.vector_repo.vectorstore.similarity_search(question, k=k)
+Human: {question}
 
-        if not docs:
-            return {"answer": "I don't know.", "sources": [], "docs": []}
+Assistant: 
+            """
+        )
+        
+        # 5. RAG Chain (KHÔNG dùng input_key/output_key - đã bị loại bỏ)
+        self.chain = ConversationalRetrievalChain.from_llm(
+            llm=self.llm,
+            retriever=self.retriever,
+            memory=self.memory,
+            combine_docs_chain_kwargs={"prompt": self.prompt},
+            verbose=verbose,
+            return_source_documents=True
+        )
+        
+        
+        print(f"✅ RAGService ready! FAISS: {faiss_path}, Top-K: {top_k}")
+    
+    def chat(self, question: str) -> Dict[str, Any]:
+        """
+        Chat RAG: question → answer + sources + citations.
+        
+        Returns:
+            {
+                'answer': str,
+                'sources': List[Dict],
+                'chat_history': List
+            }
+        """
+        # Gọi chain
+        result = self.chain({"question": question})
+        self.debug_retrieve(question)
+        # Lấy source documents
+        source_docs = result.get("source_documents", [])
 
-        context = self._format_context(docs)
-        prompt = self.prompt_template.format(context=context, question=question)
-
-        # ✅ ChatOpenAI trả về message.content
-        answer = self.llm.invoke(prompt).content
-
+        # Trích xuất sources
+        sources = [
+            {
+                "text": doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content,
+                "metadata": doc.metadata
+            }
+            for doc in source_docs
+        ]
+        
+        # Trích dẫn arxiv_id (nếu có)
+        arxiv_ids = []
+        arxiv_urls = []
+        for doc in source_docs:
+            arxiv_id = doc.metadata.get("title")
+            arxiv_url = doc.metadata.get("url")
+            if arxiv_id:
+                arxiv_ids.append(arxiv_id)
+                arxiv_urls.append(arxiv_url)
+        
+        # Thêm trích dẫn vào answer
+        answer = result["answer"].strip()
+        if arxiv_ids:
+            answer += "\n\nTrích dẫn: " + ", ".join(f"[{aid}]" for aid in arxiv_ids)
+        elif not answer.lower().__contains__("không tìm thấy"):
+            answer += "\n\n[Không có trích dẫn khả dụng]"
+        
         return {
             "answer": answer,
-            "sources": self._extract_sources(docs),
-            "docs": docs,
+            "sources": sources,
+            "chat_history": self.memory.chat_memory.messages
+        }
+    def debug_retrieve(self, question: str):
+        """Trả về list (doc, score) để xem rõ threshold."""
+        docs_with_scores = self.vectorstore.similarity_search_with_score(
+            question,
+            k=self.retriever.search_kwargs.get("k", 3)
+        )
+        
+        print("\n🔍 DEBUG SCORES:")
+        for i, (doc, score) in enumerate(docs_with_scores, start=1):
+            print(f"\n--- Result {i} ---")
+            print(f"Score: {1/(1+score)}")
+            print(f"Metadata: {doc.metadata}")
+            print(f"Content: {doc.page_content[:200]}...")
+        
+        return docs_with_scores
+    def clear_history(self):
+        """Xóa lịch sử chat."""
+        self.memory.clear()
+        print("🧹 Chat history cleared")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Lấy stats."""
+        return {
+            "faiss_path": self.repo.db_path,
+            "vector_count": len(self.vectorstore.index_to_docstore_id),
+            "top_k": self.retriever.search_kwargs.get("k"),
+            "memory_k": self.memory.k,
+            "chat_history_length": len(self.memory.chat_memory.messages)
         }

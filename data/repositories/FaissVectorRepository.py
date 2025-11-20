@@ -17,7 +17,7 @@ class VectorRepository:
 
     def _load_or_create(self):
         if os.path.exists(self.index_path):
-            return FAISS.load_local(self.index_path, self.embeddings)
+            return FAISS.load_local(self.index_path, self.embeddings,allow_dangerous_deserialization=True)
 
         dim = len(self.embeddings.embed_query("test"))
         index = faiss.IndexFlatL2(dim)
